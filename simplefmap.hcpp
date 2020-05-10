@@ -1,0 +1,733 @@
+/*
+ * Bulkrays Copyright (C) 2012-2020 Jean-Daniel Pauget
+ * ... light http server C++ library ...
+ *
+ * jdbulkrayed@disjunkt.com  -  http://bulkrays.disjunkt.com/
+ *
+ * This file is part of Bulkrays.
+ *
+ * Loopsoids is free software; you can redistribute it and/or modify
+ * it under the terms of the GNU General Public License as published by
+ * the Free Software Foundation; either version 2 of the License, or
+ * (at your option) any later version.
+ *
+ * Loopsoids is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ * GNU General Public License for more details.
+ *
+ * You should have received a copy of the GNU General Public License
+ * along with Loopsoids; if not, write to the Free Software
+ * Foundation, Inc., 59 Temple Place, Suite 330, Boston, MA  02111-1307  USA
+ *
+ * you can also try the web at http://www.gnu.org/
+ */
+
+#include "config.h"
+
+#include <sys/types.h>	    // stat opendir
+#include <sys/stat.h>	    // stat
+#include <unistd.h>	    // stat
+#include <fcntl.h>	    // open
+
+#include <string.h>	    // strerror
+#include <errno.h>	    // errno
+#include <limits.h>	    // realpath
+#include <stdlib.h>	    // realpath
+
+#include <dirent.h>	    // opendir
+#include <unistd.h>	    // readdir_r pathconf
+
+#include <sys/mman.h>	    // mmap
+
+#include <stddef.h>	    // offsetof
+
+#include <bulkrays/bulkrays.h>
+
+namespace simplefmap {
+    using namespace std;
+    using namespace bulkrays;
+
+    // some goodies in order to quickly output a full date : cout << os_time_t (mytime_t_var) << ....
+
+    struct ostream_time_t { time_t f_param; };
+
+    inline ostream_time_t
+    os_time_t(time_t param)
+    { 
+	ostream_time_t funct_struct; 
+	funct_struct.f_param = param; 
+	return funct_struct; 
+    }
+
+    template<typename _CharT, typename _Traits>
+    inline basic_ostream<_CharT,_Traits>& 
+    operator<<(basic_ostream<_CharT,_Traits>& out, ostream_time_t f_struct)
+    { 
+	time_t t = f_struct.f_param;
+	struct tm tt;
+	localtime_r (&t, &tt);
+
+	return out << setfill('0')
+	    << setw(4) << tt.tm_year+1900 << "/"
+	    << setw(2) << tt.tm_mon+1 << "/"
+	    << setw(2) << tt.tm_mday << " "
+	    << setw(2) << tt.tm_hour << ":"
+	    << setw(2) << tt.tm_min << ":"
+	    << setw(2) << tt.tm_sec;
+    }
+
+
+    struct ostream_off_t { off_t f_param; };
+
+    inline ostream_off_t
+    os_off_t (off_t param)
+    { 
+	ostream_off_t funct_struct; 
+	funct_struct.f_param = param; 
+	return funct_struct; 
+    }
+
+//    template<typename _CharT, typename _Traits>
+//    inline basic_ostream<_CharT,_Traits>& 
+//    operator<<(basic_ostream<_CharT,_Traits>& out, ostream_off_t f_struct)
+
+    inline ostream& operator<< (ostream& out, ostream_off_t f_struct)
+    { 
+	static const char * mult[] = {
+	    " ", "K", "M", "G", "T", "P", "E", "Z", "Y"
+	};    
+
+	off_t reminder = f_struct.f_param;
+	off_t prereminder = 0;
+	int pow = 0;
+	while ((pow<5) && (reminder > 1024)) {
+	    prereminder = reminder % 1024;
+	    reminder >>= 10;  /* reminder /= 1024 */
+	    pow ++;
+	}
+
+	if (pow == 0)
+	    return out << reminder << "  ";
+	else 
+	    return out << reminder << '.' << (prereminder * 10)/1024 << mult[pow];
+    }
+
+
+//    ostream& operator<< (ostream& out, const time_t &t) {
+//	struct tm tt;
+//	localtime_r (&t, &tt);
+//
+//	return out << setfill('0')
+//	    << setw(4) << tt.tm_year+1900 << "-"
+//	    << setw(2) << tt.tm_mon+1 << "-"
+//	    << setw(2) << tt.tm_mday << " "
+//	    << setw(2) << tt.tm_hour << ":"
+//	    << setw(2) << tt.tm_min << ":"
+//	    << setw(2) << tt.tm_sec;
+//    }
+
+    class direntry {
+	public:
+	    string name;
+	    int id;
+	    bool isvalid;
+	    off_t size;
+	    time_t mtime, ctime;
+	    bool isdir;
+	    direntry (const string &curdir, struct dirent const& d, int Id) : name (d.d_name) {
+		id = Id;
+		struct stat bstat;
+		string fname(curdir);
+		fname += "/";
+		fname += name;
+		if (stat (fname.c_str(), &bstat) != 0) {
+		    isvalid = false;
+		    size = 0, mtime = 0, ctime = 0;
+		    isdir = false;
+		    return;
+		}
+		isvalid = true;
+		size = bstat.st_size;
+		mtime = bstat.st_mtime;
+		ctime = bstat.st_ctime;
+		isdir = (d.d_type == DT_DIR);
+	    }
+    };
+
+    bool direntry_cmp_ctime (direntry const &a, direntry const &b) { return a.ctime < b.ctime; }
+    bool direntry_cmp_mtime (direntry const &a, direntry const &b) { return a.mtime < b.mtime; }
+    bool direntry_cmp_size  (direntry const &a, direntry const &b) { return a.size  < b.size ; }
+    bool direntry_cmp_name  (direntry const &a, direntry const &b) { return strcasecmp (a.name.c_str(), b.name.c_str()) <= 0 ; }
+
+    ostream& operator<< (ostream& out, const direntry &de) {	// JDJDJDJD some css tagging is missing here
+	out << "<td class=\"fsize\">" << os_off_t(de.size) << "</td><td class=\"ftime\">" << os_time_t (de.mtime) << "</td>"   // "<td class=\"ftime\">" << os_time_t (de.ctime) << "</td>"
+	    << "<td class=\"fname\"><a href=\"" << de.name;
+	if (de.isdir)
+	    out << '/';
+	out << "\">" << xmlencode(de.name) << "</a></td>";
+	return out;
+    }
+
+
+    class MMapBuffer : virtual public DummyBuffer {
+	private:
+	    int fd;
+	    char * mapstart;
+	    ssize_t maplength;
+	public:
+	    // regular constructor that maps the whole file and transmit the whole file
+	    MMapBuffer (int fd, char * start, ssize_t length) : DummyBuffer (start, length),
+		fd(fd),
+		mapstart (start),
+		maplength (length)
+		{}
+	    // weird constructor that maps the whole file and transmit only a part of it
+	    MMapBuffer (int fd, char * transmitstart, ssize_t transmitlength, char *mapstart, ssize_t maplength) : DummyBuffer (transmitstart, transmitlength),
+		fd(fd),
+		mapstart (mapstart),
+		maplength (maplength)
+		{}
+	    ~MMapBuffer () {
+		if (munmap (mapstart, maplength) != 0) {
+		    int e = errno;
+		    cerr << "~MMapBuffer : munmap failed : " << e << " " << strerror(e) << endl;
+		}
+		close (fd);
+	    }
+    };
+
+    class FMap_TreatRequest : virtual public TreatRequest {
+	string rootdir;
+	size_t rootdirlength;
+	map <string, DigestAuth*> mprotect;
+
+	TReqResult check_restr_and_auth (ostream &cout, HTTPRequest &req, const string & canonfname, bool isdir) {
+	    string testdir(canonfname);
+
+	    if (isdir) {
+		if (testdir[testdir.size()-1] != '/')
+		    testdir += '/';
+	    } else {
+		size_t pslash = testdir.rfind('/');
+		if (string::npos == pslash) {	// this is odd a canonical fname without a slash ??? ==> denied
+		    return error (cout, req, 403, NULL, "file permission denied (004)");
+		}
+		testdir = testdir.substr(0,pslash+1);
+	    }
+
+cerr << "checking restrictions in regard with testdir = [" << testdir << "] obtained from [" << canonfname << "]" << endl;
+	    if (mprotect.empty()) return TRPending; // nothing to check
+
+	    map <string, DigestAuth*>::iterator mpi = mprotect.lower_bound (testdir);
+	    if (mpi != mprotect.end()) {
+		size_t prot_size = mpi->first.size();
+		if (prot_size <= testdir.size()) {  // the protected dir can fit inside the path, we must test further ...
+		    if (testdir.compare(0, prot_size, mpi->first) == 0) {
+			// we apply the corresponding protection :
+			if (mpi->second == NULL) {
+cerr << "   ... forbiden by NULL protect" << endl;
+			    // no related digest => always denied
+			    return error (cout, req, 403, NULL, "file permission denied (003)");
+			} else {
+			    // we challenge to have a password
+cerr << "   ... authentication needed real=[" << mpi->second->getrealm() << "]" << endl;
+			    if (mpi->second->check (cout, req) == TRCompleted) {
+				// we did not get a valid answer
+				return TRCompleted;
+			    }
+			    // we had a valid answer we continue
+			}
+		    }
+		}
+	    }
+	    return TRPending;
+	}
+
+      public:
+
+// digestauth("private zone", "/")
+// digestauth.importdigestfile ("/etc/htdigestpasswd");
+
+	void add_digestauth (const string &dirname, DigestAuth* pdigestauth) {
+	    string dir = dirname;
+	    if (dir.empty()) {
+		dir = "/";
+	    } else if (dir[dir.size()-1] != '/') {
+		dir += '/';
+	    }
+	    mprotect [dir] = pdigestauth;
+	}
+
+	FMap_TreatRequest (string proposedrootdir) : TreatRequest(), rootdir(proposedrootdir) {
+
+		if (rootdir.empty()) {
+		    rootdir = "/";
+		} else if (rootdir[rootdir.size()-1] != '/') {
+		    rootdir += '/';
+		}
+		rootdirlength = rootdir.size();
+	    }
+
+	~FMap_TreatRequest () {}
+
+
+	virtual TReqResult output (ostream &cout, HTTPRequest &req) {
+	    // bool isGET = false;
+	    bool isHEAD = false;
+
+// if (digestauth.check (cout, req) == TRCompleted) return TRCompleted;
+
+	    if (req.method == "GET") {
+		// isGET = true;
+	    } else if (req.method == "HEAD") {
+		isHEAD = true;
+	    } else {
+		req.set_relative_expires (60);
+		return error (cout, req, 405);	// JDJDJDJD The response MUST include an Allow header containing a list of valid methods for the requested resource. 
+	    }
+
+	    bool isrootdir = false;
+
+	    string fname (rootdir);
+	    if (req.document_uri.empty())
+		req.document_uri = "/";
+	    if (req.document_uri == "/")
+		isrootdir = true;
+
+
+	    string uridecode;
+	    percentdecode (req.document_uri, uridecode);
+// req.errlog() << "req.document_uri = " << uridecode << endl;
+	    fname += uridecode;
+	    char * canonfname = realpath (fname.c_str(), NULL);	// follow and expands all symlink encountered
+	    if (canonfname == NULL) {
+		int e = errno;
+		switch (e) {
+		    case EACCES:
+			req.set_relative_expires (60);
+			return error (cout, req, 403, NULL, "file permission denied (001)");
+
+		    case ENOENT:
+			req.set_relative_expires (20);
+			return error (cout, req, 404, NULL, "Not Found (001f)");
+
+		    case ENOTDIR:
+			req.set_relative_expires (20);
+			return error (cout, req, 404, NULL, "Not Found (001d)");
+
+		    case ENAMETOOLONG:
+		    case EINVAL:
+		    case EIO:
+		    default:
+			req.errlog() << "simplefmap::output realpath gave error " << e << " " << strerror (e) << endl;
+			req.set_relative_expires (60);
+			return error (cout, req, 500);
+		}
+	    }
+
+	    if (!isrootdir) {
+		if (strncmp (canonfname, rootdir.c_str(), rootdirlength) != 0) {
+		    stringstream err;
+		    err << "simplefmap : FMap_TreatRequest::output : file " << canonfname << " fells outside of rootdir : " << rootdir;
+		    req.set_relative_expires (60);
+		    free (canonfname);
+		    return error (cout, req, 403, NULL, "file permission denied (001b)");
+		}
+	    }
+
+	    struct stat statbuf;
+	    if (lstat (canonfname, &statbuf) != 0) {
+		int e = errno;
+req.errlog() << "simplefmap::output lstat(" << canonfname << ") gave error " << e << " " << strerror (e) << endl;  // this is debug JDJDJDJD we should have an uniform way to log such things
+                switch (e) {
+		    case EACCES:
+			req.set_relative_expires (60);
+			free (canonfname);
+			return error (cout, req, 403, NULL, "file permission denied (002)");
+
+		    case ENOENT:
+			req.set_relative_expires (20);
+			free (canonfname);
+			return error (cout, req, 404, NULL, "Not Found (002f)");
+
+		    case ENOTDIR:
+			req.set_relative_expires (20);
+			free (canonfname);
+			return error (cout, req, 404, NULL, "Not found (002d)");
+
+		    case ENAMETOOLONG:
+		    case EINVAL:
+		    case EIO:
+		    default:
+			req.errlog() << "simplefmap::output lstat(" << canonfname << ") gave error " << e << " " << strerror (e) << endl;
+			req.set_relative_expires (60);
+			free (canonfname);
+			return error (cout, req, 500);
+		}
+	    }
+	    if (  !( ((S_IFREG & statbuf.st_mode) != 0) || ((S_IFDIR & statbuf.st_mode) != 0) )   )	{   // we didn't reach a file or a directory (maybe a link though, but we don't follow links)
+		req.set_relative_expires (60);
+		free (canonfname);
+		return error (cout, req, 403, NULL, "file permission denied (003)");
+	    }
+
+	    if ((S_IFDIR & statbuf.st_mode) != 0) { // we found a directory
+
+		if (TRCompleted == check_restr_and_auth (cout,req, canonfname, true))
+		    return TRCompleted;	    // some restriction or auth didn't match ....
+
+		if (isHEAD) {	// we don't give interesting results on such things yet ...
+//  HTTP/1.0 200 OK
+//  Date: Fri, 18 Oct 2013 17:56:16 GMT
+//  Expires: -1
+//  Cache-Control: private, max-age=0
+//  Content-Type: text/html; charset=ISO-8859-1
+//  Set-Cookie: NID=67=A0gxHvH3cp0D0WjpyD7XoXn3WS5niEQ0SYij_-CT2FnFiT9LNplgH03comnilUyRb89vCdQK-l6HeedAW6mkRpv8s5Uq5xHPn54cMG5x4Muo04vGRNIl8ttgDdvDQZlt; expires=Sat, 19-Apr-2014 17:56:16 GMT; path=/; domain=.; HttpOnly
+//  P3P: CP="This is not a P3P policy! See http://www.google.com/support/accounts/bin/answer.py?hl=en&answer=151657 for more info."
+//  Server: gws
+//  X-XSS-Protection: 1; mode=block
+//  X-Frame-Options: SAMEORIGIN
+//  Alternate-Protocol: 80:quic
+//  Connection: Keep-Alive
+//  Proxy-Connection: Keep-Alive
+
+		    req.statuscode = 200;
+		    req.outmime["Content-Type"] = "text/html;charset=UTF-8";
+		    req.set_relative_expires (20);	    // JDJDJDJD this should be tunable ?
+		    req.publish_header();
+		    free (canonfname);
+		    return TRCompleted;
+		}
+
+		DIR * fdir = opendir (canonfname);
+		if (fdir == NULL) {
+		    int e = errno;
+req.errlog() << "simplefmap::output opendir(" << canonfname << " ) gave error " << e << " " << strerror (e) << endl;  // this is debug JDJDJDJD we should have an uniform way to log such things
+		    switch (e) {
+			case EACCES:
+			    req.set_relative_expires (60);
+			    free (canonfname);
+			    return error (cout, req, 403, NULL, "file permission denied (003b)");
+
+			case ENOENT:
+			    req.set_relative_expires (20);
+			    free (canonfname);
+			    return error (cout, req, 404, NULL, "Not Found (003)");
+
+			default:
+			    req.set_relative_expires (60);
+			    free (canonfname);
+			    return error (cout, req, 503, NULL, "weidries occured (001)");
+		    }
+		}
+
+	list <direntry> thedir;
+	int id = 0;
+		while (true) {
+		    struct dirent *presult;
+		    if ((presult = readdir(fdir)) == NULL)
+			break;
+
+		    id ++;
+		    thedir.push_back (direntry(canonfname, *presult, id));
+		}
+
+		req.statuscode = 200;
+		req.outmime["Content-Type"] = "text/html;charset=UTF-8";
+
+// silly test just to see about auth
+// req.statuscode = 401;
+// req.outmime["WWW-Authenticate"] = "Basic realm=\"WallyWorld\"";
+
+
+		stringstream s;
+		s << 
+{{<!DOCTYPE html 
+     PUBLIC "-//W3C//DTD XHTML 1.0 Strict//EN"
+     "http://www.w3.org/TR/xhtml1/DTD/xhtml1-strict.dtd">
+<html xmlns='http://www.w3.org/1999/xhtml'>
+<head>
+ <title>}} << xmlencode (uridecode) << {{</title>
+ <link rel="stylesheet" type="text/css" href="/stylesheet.css">
+}};
+
+	list<direntry>::iterator li;
+	s <<
+{{<script>
+  var nextsortmtimeasc = false,
+	    nextsortnameasc = true,
+	    nextsortsizeasc = false;
+}};
+	thedir.sort(direntry_cmp_size);
+	s << {{var bysize = new Array(}};
+	for (li=thedir.begin(); li!=thedir.end(); li++)
+	    s << li->id << {{,}};
+	s << {{null);}} << bendl;
+
+	thedir.sort(direntry_cmp_mtime);
+	s << {{var bymtime = new Array(}};
+	for (li=thedir.begin(); li!=thedir.end(); li++)
+	    s << li->id << {{,}};
+	s << {{null);}} << bendl;
+
+	thedir.sort(direntry_cmp_name);
+	s << {{var byname = new Array(}};
+	for (li=thedir.begin(); li!=thedir.end(); li++)
+	    s << li->id << {{,}};
+	s << {{null);}} << bendl;
+
+	s << {{
+
+function sortBySize() {
+	if (nextsortsizeasc) {
+	    for (i in bysize)
+		if (bysize[i] != null) document.getElementById('thelist').appendChild(document.getElementById(bysize[i]));
+	} else {
+	    for (i=bysize.length-1 ; i>=0 ; i--)
+		if (bysize[i] != null) document.getElementById('thelist').appendChild(document.getElementById(bysize[i]));
+	}
+	nextsortsizeasc = !nextsortsizeasc;
+}
+function sortByName() {
+	if (nextsortnameasc) {
+	    for (i in byname)
+		if (byname[i] != null) document.getElementById('thelist').appendChild(document.getElementById(byname[i]));
+	} else {
+	    for (i=byname.length-1 ; i>=0 ; i--)
+		if (byname[i] != null) document.getElementById('thelist').appendChild(document.getElementById(byname[i]));
+	}
+	nextsortnameasc = !nextsortnameasc;
+}
+function sortByMTime() {
+	if (nextsortmtimeasc) {
+	    for (i in bymtime)
+		if (bymtime[i] != null) document.getElementById('thelist').appendChild(document.getElementById(bymtime[i]));
+	} else {
+	    for (i=bymtime.length-1 ; i>=0 ; i--)
+		if (bymtime[i] != null) document.getElementById('thelist').appendChild(document.getElementById(bymtime[i]));
+	}
+	nextsortmtimeasc = !nextsortmtimeasc;
+}
+</script>
+</head>
+<body>
+<h1>}} << req.document_uri << {{</h1>
+}};
+
+	{   list<direntry>::iterator li;
+	    s << {{
+<table id="thelist">
+<tr class="flistentry" id="legend">
+ <td class="listlegend"><a href="javascript:void(0)" onclick="sortBySize()">size</a></td>
+ <td class="listlegend"><a href="javascript:void(0)" onclick="sortByMTime()">mtime</a></td>
+ <td class="listlegend"><a href="javascript:void(0)" onclick="sortByName()">name</a></td>
+</tr>
+}};
+	    for (li=thedir.begin() ; li!=thedir.end() ; li++) {
+		s << {{<tr class="flistentry" id="}} << li->id << {{">}}
+		  << *li << {{</tr>}} << bendl;
+	    }
+	    s << {{
+</table>
+}};
+	}
+
+		s << {{
+</body>
+</html>
+}};
+
+		req.set_contentlength (s.str().size());
+		req.set_relative_expires (20);	    // JDJDJDJD this should be tunable ?
+		req.publish_header();
+		cout << s.str();
+		closedir (fdir);
+	    } else { // we found a file
+
+		if (TRCompleted == check_restr_and_auth (cout,req, canonfname, false))
+		    return TRCompleted;	    // some restriction or auth didn't match ....
+
+		string mime_type;
+		size_t pdot = req.document_uri.rfind('.');
+		if (pdot == string::npos) {
+		    mime_type = "text/plain";
+		} else {
+		    string terminaison = req.document_uri.substr(pdot + 1);
+		    const string * pmt = mimetypes.getmimefromterminaison (terminaison);
+		    if (pmt == NULL)
+			mime_type = "text/plain";
+		    else
+			mime_type = *pmt;
+		}
+
+		if (isHEAD) {	// we try to give interesting results
+// HTTP/1.0 200 OK
+// Date: Mon, 05 May 2008 00:33:14 GMT
+// Server: Apache/2.0.52 (Red Hat)
+// Accept-Ranges: bytes
+// Content-Length: 3980
+// Content-Type: image/jpeg
+
+		    req.statuscode = 200;
+		    req.outmime["Accept-Ranges"] = "bytes";
+		    req.outmime["Content-Type"] = mime_type;
+		    req.set_contentlength (statbuf.st_size);
+		    req.set_relative_expires (3660);	// JDJDJDJD this should be tuneable, with mime type ?
+	    req.outmime["Keep-Alive"] = "timeout=15, max=100";
+		    req.publish_header();
+
+		    free (canonfname);
+		    return TRCompleted;
+		}
+
+		size_t rangestart, rangeend;
+
+		if (getrange (req.mime, rangestart, rangeend)) {
+		    if (rangestart == BULKNPOS) {
+			cerr << "after range computation rangestart is BULKNPOS ??? ignored" << endl;
+		    } else {
+			if (rangestart > (size_t)statbuf.st_size) { // we're asked something further than the eof
+			    req.statuscode = 206;
+			    req.outmime["Accept-Ranges"] = "bytes";
+			    req.outmime["Content-Type"] = mime_type;
+			    req.set_contentlength (0);
+			    stringstream s;
+			    s << "bytes " << statbuf.st_size << "-" << statbuf.st_size << "/" << statbuf.st_size;
+			    req.outmime["Content-Range"] = s.str();
+			    req.set_relative_expires (3660);
+	    req.outmime["Keep-Alive"] = "timeout=15, max=100";
+			    req.publish_header();
+			    free (canonfname);
+			    return TRCompleted;
+			}
+			if ((rangeend == 0) || (rangeend == BULKNPOS)) {
+			    rangeend = statbuf.st_size - 1;
+			}
+		    }
+		}
+
+		int f = open (canonfname, O_RDONLY);
+		if (f < 0) {
+		    int e = errno;
+		    req.errlog() << "simplefmap::output open(" << canonfname << ") failed : " << e << " " << strerror(e) << endl;
+
+		    free (canonfname);
+		    req.set_relative_expires (60);
+		    return error (cout, req, 403, NULL, "file permission denied (004)");
+		}
+
+		char * fmap = (char *) mmap(NULL, statbuf.st_size, PROT_READ, MAP_PRIVATE, f, 0);
+		if (fmap == MAP_FAILED) {
+		    int e = errno;
+		    req.errlog() << "simplefmap::output mmap(" << canonfname << ") failed : " << e << " " << strerror(e) << endl;
+
+		    close (f);
+		    free (canonfname);
+		    req.set_relative_expires (60);
+		    return error (cout, req, 403, NULL, "file permission denied (005)");
+		}
+
+		if ((rangestart != BULKNPOS) && ((rangeend-rangestart + 1) < (size_t)statbuf.st_size)) {    // we have a range shorter than the file
+		    req.statuscode = 206;
+		    req.outmime["Accept-Ranges"] = "bytes";
+		    req.outmime["Content-Type"] = mime_type;
+		    stringstream s;
+		    s << "bytes " << rangestart << "-" << rangeend << "/" << statbuf.st_size;
+		    req.outmime["Content-Range"] = s.str();
+		    req.set_contentlength (rangeend-rangestart + 1);
+		    req.set_relative_expires (3660);	// JDJDJDJD this should be tuneable, with mime type ?
+	    req.outmime["Keep-Alive"] = "timeout=15, max=100";
+		    req.publish_header();
+
+		    MMapBuffer* mmbuf = new MMapBuffer (f, fmap+rangestart, rangeend-rangestart + 1, fmap, statbuf.st_size);
+		    if (mmbuf == NULL) {
+			req.errlog() << "could not allocate MMapBuffer" << endl;
+			munmap (fmap, statbuf.st_size);
+			close (f);
+		    }
+		    req.httppconn->pushdummybuffer (mmbuf);
+
+		} else {    // either no range or range is the whole file
+
+		    req.statuscode = 200;
+		    req.outmime["Accept-Ranges"] = "bytes";
+		    req.outmime["Content-Type"] = mime_type;
+		    req.set_contentlength (statbuf.st_size);
+		    req.set_relative_expires (3660);	// JDJDJDJD this should be tuneable, with mime type ?
+	    req.outmime["Keep-Alive"] = "timeout=15, max=100";
+		    req.publish_header();
+
+
+		    MMapBuffer* mmbuf = new MMapBuffer (f, fmap, statbuf.st_size);
+		    if (mmbuf == NULL) {
+			req.errlog() << "could not allocate MMapBuffer" << endl;
+			munmap (fmap, statbuf.st_size);
+			close (f);
+		    }
+		    req.httppconn->pushdummybuffer (mmbuf);
+		}
+
+	    }
+	    free (canonfname);
+
+	    return TRCompleted;
+	}
+    };
+
+    class fmap_urimapper : virtual public URIMapper {
+	public:
+	    FMap_TreatRequest fmap_treatrequest;
+
+	    fmap_urimapper(string rootdir) : URIMapper(), fmap_treatrequest(rootdir) {}
+	    ~fmap_urimapper() {}
+	    virtual TreatRequest* treatrequest (HTTPRequest &req) {
+		return &fmap_treatrequest;
+	    }
+	    
+	    void add_digestauth (const string &dirname, DigestAuth* pdigestauth) {
+		fmap_treatrequest.add_digestauth (dirname, pdigestauth);
+	    }
+    };
+
+    fmap_urimapper *mapper = NULL;
+    DigestAuth *pdigest = NULL;
+    int simplefmap_global (BSOperation op) {
+#if OSXFILESCHEME == 1
+	string rootdir ("/Users/bulkrayed");
+#else
+	string rootdir("/home/bulkrayed");
+#endif
+	switch (op) {
+	  case StartUp:
+	    mapper = new fmap_urimapper(rootdir);
+//	    mapper = new fmap_urimapper("/BIG/home/webs/hashttpp.zz/html");
+	    if (mapper == NULL) {
+		cerr << "bulkrays::testsite_global could not allocate fmap_urimapper" << endl;
+		return -1;
+	    }
+	    pdigest = new DigestAuth("password protected", "/");
+	    if (pdigest == NULL) {
+		cerr << "bulkrays::testsite_global could not allocate pdigest" << endl;
+		delete (mapper);
+		return -1;
+	    }
+	    pdigest->importdigestfile ("/etc/htdigestpasswd");
+	    mapper->add_digestauth (rootdir+"/protected", pdigest);
+	    mapper->add_digestauth (rootdir+"/deeper/protected", pdigest);
+//	    hostmapper["hashttpp.zz"] = mapper;
+//	    hostmapper["127.0.0.1:10080"] = mapper;
+	    hostmapper["bulkrays2.nkdn.fr"] = mapper;
+	    hostmapper["bulkrays2.nkdn.fr:10080"] = mapper;
+	    unset_default_host ();
+	    return 0;
+
+	  case ShutDown:
+	    if (mapper == NULL) return -1;
+	    hostmapper.deregisterall (mapper);
+	    delete (mapper);
+	    return 0;
+	}
+	return -1;
+    }
+}
